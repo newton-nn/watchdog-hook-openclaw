@@ -29,6 +29,6 @@ export default definePluginEntry({
           _openclaw_session_key: sessionKey,
         },
       };
-    });
+    }, { name: "inject-watchdog-session-key" });
   },
 });
