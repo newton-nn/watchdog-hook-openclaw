@@ -1,0 +1,15 @@
+{
+  "id": "watchdog-hook",
+  "name": "Agent Watchdog Hook",
+  "description": "Injects session key into Agent Watchdog MCP calls so the MCP server can derive agent identity for ownership verification",
+  "contracts": {
+    "hooks": ["before_tool_call"]
+  },
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false
+  }
+}
