@@ -9,11 +9,18 @@ export default definePluginEntry({
   register(api) {
     console.log("[watchdog-hook] register() called");
     api.registerHook("before_tool_call", async (event, ctx) => {
-      // Log every tool call to verify the hook fires
-      console.log(`[watchdog-hook] before_tool_call: ${event.toolName} sessionKey=${ctx.sessionKey || '(none)'}`);
+      // Log the actual tool name to discover the correct namespace format
+      console.log(`[watchdog-hook] before_tool_call: toolName="${event.toolName}" sessionKey=${ctx.sessionKey || '(none)'} agentId=${ctx.agentId || '(none)'}`);
       
-      // Only intercept Agent Watchdog MCP tool calls
-      if (!event.toolName.startsWith("mcp__agent-watchdog__")) {
+      // Match any agent-watchdog tool call regardless of prefix
+      const isWatchdogTool =
+        event.toolName.startsWith("mcp__agent-watchdog__") ||
+        event.toolName.startsWith("agent-watchdog__") ||
+        event.toolName.startsWith("mcp__agent-watchdog") ||
+        // Also try checking if the tool name contains agent-watchdog
+        event.toolName.includes("agent-watchdog");
+      
+      if (!isWatchdogTool) {
         return;
       }
 
