@@ -7,7 +7,11 @@ export default definePluginEntry({
     "Injects agent identity into Agent Watchdog MCP calls via before_tool_call hook",
 
   register(api) {
+    console.log("[watchdog-hook] register() called");
     api.registerHook("before_tool_call", async (event, ctx) => {
+      // Log every tool call to verify the hook fires
+      console.log(`[watchdog-hook] before_tool_call: ${event.toolName} sessionKey=${ctx.sessionKey || '(none)'}`);
+      
       // Only intercept Agent Watchdog MCP tool calls
       if (!event.toolName.startsWith("mcp__agent-watchdog__")) {
         return;
