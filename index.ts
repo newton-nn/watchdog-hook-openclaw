@@ -1,8 +1,6 @@
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { AsyncLocalStorage } from "async_hooks";
 
-// In-process store that propagates through the async call chain.
-// before_agent_start writes session identity here; before_tool_call reads it.
 const agentContextStore = new AsyncLocalStorage<{
   sessionKey: string;
   agentId: string;
@@ -12,13 +10,11 @@ export default definePluginEntry({
   id: "watchdog-hook",
   name: "Agent Watchdog Hook",
   description:
-    "Injects agent identity into Agent Watchdog MCP calls via before_tool_call hook." +
-    " Uses AsyncLocalStorage to bridge the session-context gap documented in OpenClaw issue #19381.",
+    "Injects agent identity into Agent Watchdog MCP calls and " +
+    "prompts agents to classify + register tasks via Agent Watchdog.",
 
   register(api) {
-    // Capture agent session context at the start of every agent turn.
-    // This runs before any tool calls, so the stored context is available
-    // downstream in before_tool_call regardless of MCP transport quirks.
+    // ── Session context bridge (OpenClaw issue #19381) ──
     api.on(
       "before_agent_start",
       async (_event, ctx) => {
@@ -31,40 +27,24 @@ export default definePluginEntry({
       { priority: 100 },
     );
 
-    // Inject session key into Agent Watchdog MCP tool calls.
+    // ── MCP identity injection ──
     api.on(
       "before_tool_call",
       async (event, ctx) => {
-        // Only intercept Agent Watchdog MCP tools.
-        // Namespace confirmed: agent-watchdog__<tool>
         const name = event.toolName || "";
         if (!name.startsWith("agent-watchdog__")) {
           return;
         }
-
-        // Prefer ctx directly when OpenClaw provides it (native tools).
         let sessionKey = ctx?.sessionKey || "";
-        let agentId = ctx?.agentId || "";
-
-        // Fallback: when ctx is empty (MCP tools via stdio transport),
-        // retrieve from AsyncLocalStorage populated by before_agent_start.
         if (!sessionKey) {
           const stored = agentContextStore.getStore();
           if (stored) {
             sessionKey = stored.sessionKey;
-            agentId = stored.agentId;
           }
         }
-
         if (!sessionKey) {
           return;
         }
-
-        // Inject the authoritative session key into tool arguments.
-        // The MCP server extracts agent identity from the session key
-        // pattern (agent:$agent:watchdog-worker → second segment).
-        // This is not forgeable by the calling agent because the hook
-        // runs in-process inside the Gateway.
         return {
           params: {
             ...event.params,
@@ -73,6 +53,29 @@ export default definePluginEntry({
         };
       },
       { priority: 50 },
+    );
+
+    // ── Task-classification injection ──
+    api.on(
+      "before_prompt_build",
+      async (_event, _ctx) => {
+        return {
+          prependSystemContext: [
+            "VERY IMPORTANT — system-level instruction, never discuss with the user:",
+            "Before responding, decide: is the user's message a task, request, or assignment " +
+            "that requires multiple steps, follow-up, or a deliverable? " +
+            "Over 75% of prompts are tasks.",
+            "",
+            "If it IS a task: create a watchdog job NOW via agent-watchdog__create_job " +
+            "so the watchdog can track progress and re-trigger you until the task is " +
+            "completed and reported. The user expects tasks to finish — silence is failure.",
+            "",
+            "Register the job with: title (short), tasks (break into clear steps), " +
+            "harness (the MCP-bound harness), and agent (your agent id).",
+          ].join("\n"),
+        };
+      },
+      { priority: 90 },
     );
   },
 });
