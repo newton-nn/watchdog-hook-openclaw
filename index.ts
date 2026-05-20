@@ -58,7 +58,58 @@ export default definePluginEntry({
     // ── Task-classification injection ──
     api.on(
       "before_prompt_build",
-      async (_event, _ctx) => {
+      async (event, _ctx) => {
+        // Detect whether this turn is a watchdog-triggered resume (the agent
+        // is being woken to continue an EXISTING job).  In that case we must
+        // NOT tell it to create a new job — doing so causes infinite recursive
+        // job creation where each trigger spawns a fresh job instead of updating
+        // the original task.
+        const messageText = (event as any)?.message || (event as any)?.text || "";
+        const isWatchdogTrigger =
+          typeof messageText === "string" &&
+          messageText.includes("Agent Watchdog trigger:");
+
+        // Common lifecycle steps used in both branches.
+        const lifecycleSteps = [
+          "",
+          "═══════════════════════════════════════════════════════════════════",
+          "MANDATORY TASK LIFECYCLE — FAILURE TO FOLLOW WILL RETRIGGER TASKS:",
+          "═══════════════════════════════════════════════════════════════════",
+          "  1. START work → call agent-watchdog__update_task with status='running'",
+          "  2. WORKING → call agent-watchdog__renew_lease every ~5 minutes while working",
+          "  3. COMPLETE work → call agent-watchdog__update_task with status='completed'",
+          "  4. REPORT results to user → send your reply/message to the user",
+          "  5. MARK REPORTED → call agent-watchdog__update_task with status='reported'",
+          "",
+          "  ⚠️ STEP 5 IS THE MOST CRITICAL AND MOST FORGOTTEN STEP. ⚠️",
+          "  ⚠️ completed ≠ reported. If you skip step 5, the watchdog will RE-TRIGGER this task again. ⚠️",
+          "  ⚠️ ALWAYS call agent-watchdog__update_task with status='reported' IMMEDIATELY after your final reply to the user. ⚠️",
+          "",
+          "  If you fail or hit a blocker:",
+          "    • Call agent-watchdog__update_task with last_error='<descriptive error>' so the user knows what went wrong",
+          "    • Call agent-watchdog__add_task_note with details about the blocker",
+          "",
+          "  REMEMBER: The task is ONLY done when status='reported'. completed alone means NOTHING to the watchdog.",
+        ];
+
+        if (isWatchdogTrigger) {
+          // The agent is resuming an existing watchdog task.
+          // Do NOT tell it to create a new job — work on the existing one.
+          return {
+            prependSystemContext: [
+              "VERY IMPORTANT — system-level instruction, never discuss with the user:",
+              "",
+              "You are currently handling an EXISTING Agent Watchdog task that was triggered " +
+              "by the watchdog daemon. Do NOT create a new job. Instead, locate the " +
+              "job_id and task_id in the trigger message above and use the Agent Watchdog " +
+              "MCP tools (update_task, add_task_note, renew_lease) to progress and " +
+              "eventually mark the task as reported.",
+              ...lifecycleSteps,
+            ].join("\n"),
+          };
+        }
+
+        // Normal conversation: prompt the agent to create a new job for new tasks.
         return {
           prependSystemContext: [
             "VERY IMPORTANT — system-level instruction, never discuss with the user:",
@@ -73,25 +124,7 @@ export default definePluginEntry({
             "Register the job with: title (short), tasks (break into clear steps). " +
             "Do NOT pass harness or agent — those are set automatically by the MCP server. " +
             "Call agent-watchdog__create_job with only title and tasks.",
-            "",
-            "═══════════════════════════════════════════════════════════════════",
-            "MANDATORY TASK LIFECYCLE — FAILURE TO FOLLOW WILL RETRIGGER TASKS:",
-            "═══════════════════════════════════════════════════════════════════",
-            "  1. START work → call agent-watchdog__update_task with status='running'",
-            "  2. WORKING → call agent-watchdog__renew_lease every ~5 minutes while working",
-            "  3. COMPLETE work → call agent-watchdog__update_task with status='completed'",
-            "  4. REPORT results to user → send your reply/message to the user",
-            "  5. MARK REPORTED → call agent-watchdog__update_task with status='reported'",
-            "",
-            "  ⚠️ STEP 5 IS THE MOST CRITICAL AND MOST FORGOTTEN STEP. ⚠️",
-            "  ⚠️ completed ≠ reported. If you skip step 5, the watchdog will RE-TRIGGER this task again. ⚠️",
-            "  ⚠️ ALWAYS call agent-watchdog__update_task with status='reported' IMMEDIATELY after your final reply to the user. ⚠️",
-            "",
-            "  If you fail or hit a blocker:",
-            "    • Call agent-watchdog__update_task with last_error='<descriptive error>' so the user knows what went wrong",
-            "    • Call agent-watchdog__add_task_note with details about the blocker",
-            "",
-            "  REMEMBER: The task is ONLY done when status='reported'. completed alone means NOTHING to the watchdog.",
+            ...lifecycleSteps,
           ].join("\n"),
         };
       },
