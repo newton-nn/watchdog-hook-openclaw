@@ -70,8 +70,9 @@ export default definePluginEntry({
             "so the watchdog can track progress and re-trigger you until the task is " +
             "completed and reported. The user expects tasks to finish — silence is failure.",
             "",
-            "Register the job with: title (short), tasks (break into clear steps), " +
-            "harness (the MCP-bound harness), and agent (your agent id).",
+            "Register the job with: title (short), tasks (break into clear steps). " +
+            "Do NOT pass harness or agent — those are set automatically by the MCP server. " +
+            "Call agent-watchdog__create_job with only title and tasks.",
           ].join("\n"),
         };
       },
