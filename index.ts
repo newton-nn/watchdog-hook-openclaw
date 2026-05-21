@@ -15,6 +15,10 @@ export default definePluginEntry({
 
   register(api) {
     // ── Session context bridge (OpenClaw issue #19381) ──
+    // We use AsyncLocalStorage to propagate { sessionKey, agentId } from
+    // before_agent_start (where it’s available on ctx) to the MCP tool
+    // handlers, which run in a different async context.  This is required
+    // because OpenClaw does not currently expose ctx to tool calls.
     api.on(
       "before_agent_start",
       async (_event, ctx) => {
@@ -56,18 +60,48 @@ export default definePluginEntry({
     );
 
     // ── Task-classification injection ──
+    // We MUST NOT tell the agent to "create a new job" when it is being
+    // woken to resume an EXISTING watchdog task — doing so causes infinite
+    // recursive job creation.  A session is a watchdog session when its
+    // sessionKey matches the worker pattern built by the harness
+    // (agent:<id>:watchdog-worker) or when the conversation prompt / last
+    // message contains the watchdog trigger text.
     api.on(
       "before_prompt_build",
-      async (event, _ctx) => {
-        // Detect whether this turn is a watchdog-triggered resume (the agent
-        // is being woken to continue an EXISTING job).  In that case we must
-        // NOT tell it to create a new job — doing so causes infinite recursive
-        // job creation where each trigger spawns a fresh job instead of updating
-        // the original task.
-        const messageText = (event as any)?.message || (event as any)?.text || "";
-        const isWatchdogTrigger =
-          typeof messageText === "string" &&
-          messageText.includes("Agent Watchdog trigger:");
+      async (event, ctx) => {
+        // ── Detection strategy ──
+        // 1. Check the session key (most reliable).  OpenClaw passes the
+        //    same hookCtx to every hook in a turn, so ctx.sessionKey is
+        //    available here just like it is in before_agent_start.
+        const sessionKey = (ctx as any)?.sessionKey || "";
+        const stored = agentContextStore.getStore();
+        const effectiveSessionKey = sessionKey || stored?.sessionKey || "";
+        const isWatchdogSession =
+          effectiveSessionKey.includes("watchdog") ||
+          /^agent:[^:]+:watchdog-worker$/.test(effectiveSessionKey);
+
+        // 2. Secondary check: inspect the prompt / last message for the
+        //    literal trigger text injected by the harness.
+        const promptText = typeof event.prompt === "string" ? event.prompt : "";
+        const isWatchdogFromPrompt = promptText.includes("Agent Watchdog trigger:");
+
+        let lastMessageText = "";
+        if (Array.isArray(event.messages) && event.messages.length > 0) {
+          const last = event.messages[event.messages.length - 1];
+          if (typeof last === "string") {
+            lastMessageText = last;
+          } else if (last && typeof (last as any).text === "string") {
+            lastMessageText = (last as any).text;
+          } else if (last && typeof (last as any).content === "string") {
+            lastMessageText = (last as any).content;
+          } else if (last && typeof (last as any).body === "string") {
+            lastMessageText = (last as any).body;
+          }
+        }
+        const isWatchdogFromMessages = lastMessageText.includes("Agent Watchdog trigger:");
+
+        const definitelyWatchdog =
+          isWatchdogSession || isWatchdogFromPrompt || isWatchdogFromMessages;
 
         // Common lifecycle steps used in both branches.
         const lifecycleSteps = [
@@ -92,7 +126,7 @@ export default definePluginEntry({
           "  REMEMBER: The task is ONLY done when status='reported'. completed alone means NOTHING to the watchdog.",
         ];
 
-        if (isWatchdogTrigger) {
+        if (definitelyWatchdog) {
           // The agent is resuming an existing watchdog task.
           // Do NOT tell it to create a new job — work on the existing one.
           return {
