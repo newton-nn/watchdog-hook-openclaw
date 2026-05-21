@@ -4,6 +4,7 @@ import { AsyncLocalStorage } from "async_hooks";
 const agentContextStore = new AsyncLocalStorage<{
   sessionKey: string;
   agentId: string;
+  sessionId: string | undefined;
 }>();
 
 export default definePluginEntry({
@@ -24,8 +25,9 @@ export default definePluginEntry({
       async (_event, ctx) => {
         const sessionKey = ctx?.sessionKey || "";
         const agentId = ctx?.agentId || "";
+        const sessionId = (ctx as any)?.sessionId || "";
         if (sessionKey) {
-          agentContextStore.enterWith({ sessionKey, agentId });
+          agentContextStore.enterWith({ sessionKey, agentId, sessionId });
         }
       },
       { priority: 100 },
@@ -39,20 +41,22 @@ export default definePluginEntry({
         if (!name.startsWith("agent-watchdog__")) {
           return;
         }
-        let sessionKey = ctx?.sessionKey || "";
-        if (!sessionKey) {
-          const stored = agentContextStore.getStore();
-          if (stored) {
-            sessionKey = stored.sessionKey;
-          }
-        }
+        const stored = agentContextStore.getStore();
+        const sessionKey = ctx?.sessionKey || stored?.sessionKey || "";
+        const sessionId = stored?.sessionId;
         if (!sessionKey) {
           return;
+        }
+        const injected: Record<string, string> = {
+          _openclaw_session_key: sessionKey,
+        };
+        if (sessionId) {
+          injected._openclaw_session_id = sessionId;
         }
         return {
           params: {
             ...event.params,
-            _openclaw_session_key: sessionKey,
+            ...injected,
           },
         };
       },
