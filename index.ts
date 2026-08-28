@@ -1,39 +1,64 @@
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
-import { AsyncLocalStorage } from "async_hooks";
 
-const agentContextStore = new AsyncLocalStorage<{
-  sessionKey: string;
-  agentId: string;
-  sessionId: string | undefined;
-}>();
+interface AgentWorkspaceConfig {
+  endpoint: string;
+  workspace: string;
+  agents: Record<string, {
+    username: string;
+    apiKeyEnv?: string;
+    apiKey?: string;
+  }>;
+}
+
+interface WatchdogPluginConfig {
+  workspaces?: Record<string, AgentWorkspaceConfig>;
+}
+
+function loadPluginConfig(api: any): WatchdogPluginConfig {
+  try {
+    const raw = api?.getConfig?.() || (api as any)?.config || {};
+    return raw as WatchdogPluginConfig;
+  } catch {
+    return {};
+  }
+}
+
+function resolveAgentWorkspace(
+  config: WatchdogPluginConfig,
+  agentId: string,
+): { workspace: string; endpoint: string; agentConfig: AgentWorkspaceConfig["agents"][string] } | null {
+  if (!config.workspaces || !agentId) return null;
+  for (const [_name, ws] of Object.entries(config.workspaces)) {
+    if (ws.agents && ws.agents[agentId]) {
+      return { workspace: ws.workspace, endpoint: ws.endpoint, agentConfig: ws.agents[agentId] };
+    }
+  }
+  return null;
+}
+
+function getApiKey(agentConfig: AgentWorkspaceConfig["agents"][string]): string | null {
+  if (agentConfig.apiKeyEnv) {
+    const val = process.env[agentConfig.apiKeyEnv];
+    if (val) return val;
+  }
+  if (agentConfig.apiKey) return agentConfig.apiKey;
+  return null;
+}
 
 export default definePluginEntry({
   id: "watchdog-hook",
   name: "Agent Watchdog Hook",
   description:
-    "Injects agent identity into Agent Watchdog MCP calls and " +
-    "prompts agents to classify + register tasks via Agent Watchdog.",
+    "Injects agent identity, workspace credentials, and audit params into Agent Watchdog MCP calls.",
 
   register(api) {
-    // ── Session context bridge (OpenClaw issue #19381) ──
-    // We use AsyncLocalStorage to propagate { sessionKey, agentId } from
-    // before_agent_start (where it’s available on ctx) to the MCP tool
-    // handlers, which run in a different async context.  This is required
-    // because OpenClaw does not currently expose ctx to tool calls.
-    api.on(
-      "before_agent_start",
-      async (_event, ctx) => {
-        const sessionKey = ctx?.sessionKey || "";
-        const agentId = ctx?.agentId || "";
-        const sessionId = (ctx as any)?.sessionId || "";
-        if (sessionKey) {
-          agentContextStore.enterWith({ sessionKey, agentId, sessionId });
-        }
-      },
-      { priority: 100 },
-    );
+    const config = loadPluginConfig(api);
 
-    // ── MCP identity injection ──
+    // ── MCP identity + workspace credential injection ──
+    // The gateway (2026.8.1+) provides sessionKey/agentId/sessionId natively
+    // on the before_tool_call hook context, so no AsyncLocalStorage bridge is
+    // needed (the old before_agent_start bridge was removed from the gateway's
+    // valid hook set).
     api.on(
       "before_tool_call",
       async (event, ctx) => {
@@ -41,18 +66,32 @@ export default definePluginEntry({
         if (!name.startsWith("agent-watchdog__")) {
           return;
         }
-        const stored = agentContextStore.getStore();
-        const sessionKey = ctx?.sessionKey || stored?.sessionKey || "";
-        const sessionId = stored?.sessionId;
+        const sessionKey = ctx?.sessionKey || "";
+        const sessionId = (ctx as any)?.sessionId;
+        const agentId = ctx?.agentId || "";
         if (!sessionKey) {
           return;
         }
+
         const injected: Record<string, string> = {
           _openclaw_session_key: sessionKey,
+          _openclaw_agent_id: agentId,
         };
         if (sessionId) {
           injected._openclaw_session_id = sessionId;
         }
+
+        // Resolve workspace mapping for this agent
+        const resolved = resolveAgentWorkspace(config, agentId);
+        if (resolved) {
+          injected._watchdog_workspace = resolved.workspace;
+          injected._watchdog_account_username = resolved.agentConfig.username;
+          const apiKey = getApiKey(resolved.agentConfig);
+          if (apiKey) {
+            injected._watchdog_api_key = apiKey;
+          }
+        }
+
         return {
           params: {
             ...event.params,
@@ -64,28 +103,14 @@ export default definePluginEntry({
     );
 
     // ── Task-classification injection ──
-    // We MUST NOT tell the agent to "create a new job" when it is being
-    // woken to resume an EXISTING watchdog task — doing so causes infinite
-    // recursive job creation.  A session is a watchdog session when its
-    // sessionKey matches the worker pattern built by the harness
-    // (agent:<id>:watchdog-worker) or when the conversation prompt / last
-    // message contains the watchdog trigger text.
     api.on(
       "before_prompt_build",
       async (event, ctx) => {
-        // ── Detection strategy ──
-        // 1. Check the session key (most reliable).  OpenClaw passes the
-        //    same hookCtx to every hook in a turn, so ctx.sessionKey is
-        //    available here just like it is in before_agent_start.
-        const sessionKey = (ctx as any)?.sessionKey || "";
-        const stored = agentContextStore.getStore();
-        const effectiveSessionKey = sessionKey || stored?.sessionKey || "";
+        const effectiveSessionKey = (ctx as any)?.sessionKey || "";
         const isWatchdogSession =
           effectiveSessionKey.includes("watchdog") ||
           /^agent:[^:]+:watchdog-worker$/.test(effectiveSessionKey);
 
-        // 2. Secondary check: inspect the prompt / last message for the
-        //    literal trigger text injected by the harness.
         const promptText = typeof event.prompt === "string" ? event.prompt : "";
         const isWatchdogFromPrompt = promptText.includes("Agent Watchdog trigger:");
 
@@ -107,7 +132,6 @@ export default definePluginEntry({
         const definitelyWatchdog =
           isWatchdogSession || isWatchdogFromPrompt || isWatchdogFromMessages;
 
-        // Common lifecycle steps used in both branches.
         const lifecycleSteps = [
           "",
           "═══════════════════════════════════════════════════════════════════",
@@ -131,23 +155,20 @@ export default definePluginEntry({
         ];
 
         if (definitelyWatchdog) {
-          // The agent is resuming an existing watchdog task.
-          // Do NOT tell it to create a new job — work on the existing one.
           return {
             prependSystemContext: [
               "VERY IMPORTANT — system-level instruction, never discuss with the user:",
               "",
-              "You are currently handling an EXISTING Agent Watchdog task that was triggered " +
-              "by the watchdog daemon. Do NOT create a new job. Instead, locate the " +
-              "job_id and task_id in the trigger message above and use the Agent Watchdog " +
-              "MCP tools (update_task, add_task_note, renew_lease) to progress and " +
+              "You are currently handling an EXISTING task that was triggered " +
+              "by the system. Do NOT create a new job. Instead, locate the " +
+              "job_id and task_id in the trigger message above and use the " +
+              "appropriate tools (update_task, add_task_note, renew_lease) to progress and " +
               "eventually mark the task as reported.",
               ...lifecycleSteps,
             ].join("\n"),
           };
         }
 
-        // Normal conversation: prompt the agent to create a new job for new tasks.
         return {
           prependSystemContext: [
             "VERY IMPORTANT — system-level instruction, never discuss with the user:",
@@ -155,8 +176,8 @@ export default definePluginEntry({
             "that requires multiple steps, follow-up, or a deliverable? " +
             "Over 75% of prompts are tasks.",
             "",
-            "If it IS a task: create a watchdog job NOW via agent-watchdog__create_job " +
-            "so the watchdog can track progress and re-trigger you until the task is " +
+            "If it IS a task: create a job NOW via agent-watchdog__create_job " +
+            "so progress can be tracked and you can be re-triggered until the task is " +
             "completed and reported. The user expects tasks to finish — silence is failure.",
             "",
             "Register the job with: title (short), tasks (break into clear steps). " +

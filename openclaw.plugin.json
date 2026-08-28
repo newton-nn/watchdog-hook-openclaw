@@ -1,15 +1,42 @@
 {
   "id": "watchdog-hook",
   "name": "Agent Watchdog Hook",
-  "description": "Injects session key into Agent Watchdog MCP calls so the MCP server can derive agent identity for ownership verification",
+  "description": "Injects workspace authorization, audit params, and session identity into Agent Watchdog MCP tool calls.",
   "contracts": {
-    "hooks": ["before_tool_call"]
+    "hooks": ["before_tool_call", "before_prompt_build"]
   },
   "activation": {
     "onStartup": true
   },
   "configSchema": {
     "type": "object",
-    "additionalProperties": false
+    "additionalProperties": false,
+    "properties": {
+      "workspaces": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "object",
+          "required": ["endpoint", "workspace", "agents"],
+          "properties": {
+            "endpoint": {"type": "string"},
+            "workspace": {"type": "string"},
+            "agents": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "object",
+                "required": ["username"],
+                "properties": {
+                  "username": {"type": "string"},
+                  "apiKeyEnv": {"type": "string"},
+                  "apiKey": {"type": "string"}
+                },
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    }
   }
 }
